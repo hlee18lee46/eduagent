@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Edu Agent (Local LLM + Tools)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px;margin:24px auto;padding:0 12px}
+    .row{display:flex;gap:8px;align-items:center}
+    textarea,input[type=text]{width:100%}
+    pre{white-space:pre-wrap;background:#0b1020;color:#e1eaff;padding:12px;border-radius:12px}
+    .panel{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+    button{padding:8px 12px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;cursor:pointer}
+    button:hover{filter:brightness(1.1)}
+  </style>
+</head>
+<body>
+  <h1>Edu Accessibility Agent (LangChain + llama.cpp tools)</h1>
+
+  <div class="panel">
+    <h2>Ask the Agent</h2>
+    <div class="row">
+      <input id="q" type="text" placeholder="e.g., What is due next week in course 12345?"/>
+      <button onclick="ask()">Ask</button>
+    </div>
+    <h3>Answer</h3>
+    <pre id="answer" class="mono"></pre>
+    <h3>Tool Trace</h3>
+    <pre id="trace" class="mono"></pre>
+  </div>
+
+  <div class="panel">
+    <h2>Upload Image (for Mathpix)</h2>
+    <input id="img" type="file" accept="image/*"/>
+    <button onclick="toDataUrl()">Make Data URL</button>
+    <pre id="imgOut" class="mono"></pre>
+  </div>
+
+  <div class="panel">
+    <h2>Play last TTS (if any)</h2>
+    <audio id="player" controls></audio>
+  </div>
+
+<script>
+async function ask(){
+  const q = document.getElementById('q').value.trim();
+  const r = await fetch('/api/agent', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ input: q })
+  });
+  const j = await r.json();
+  document.getElementById('answer').textContent = j.output || JSON.stringify(j,null,2);
+
+  // Try to auto-play audio if the agent used tts tool
+  if (j.intermediate_steps) {
+    const ttsStep = j.intermediate_steps.find(s => s.tool === 'tts');
+    if (ttsStep) {
+      try {
+        const data = JSON.parse(ttsStep.observation);
+        if (data.audio_url) {
+          const a = document.getElementById('player');
+          a.src = data.audio_url;
+          a.play().catch(()=>{});
+        }
+      } catch(e){}
+    }
+  }
+  document.getElementById('trace').textContent = JSON.stringify(j.intermediate_steps, null, 2);
+}
+
+async function toDataUrl(){
+  const f = document.getElementById('img').files[0];
+  if(!f){ alert('Pick an image'); return; }
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/upload-image', { method:'POST', body: fd });
+  const j = await r.json();
+  document.getElementById('imgOut').textContent = j.data_url ? j.data_url.slice(0,120) + '…' : JSON.stringify(j,null,2);
+}
+</script>
+</body>
+</html>

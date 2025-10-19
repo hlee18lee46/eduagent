@@ -1,0 +1,8 @@
+Flask==3.0.3
+flask-cors==4.0.0
+python-dotenv==1.0.1
+requests==2.32.3
+
+# LangChain
+langchain==0.2.16
+langchain-openai==0.1.22
