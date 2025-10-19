@@ -1,82 +1,452 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-bs-theme="dark">
 <head>
-  <meta charset="utf-8"/>
-  <title>Edu Agent (Local LLM + Tools)</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px;margin:24px auto;padding:0 12px}
-    .row{display:flex;gap:8px;align-items:center}
-    textarea,input[type=text]{width:100%}
-    pre{white-space:pre-wrap;background:#0b1020;color:#e1eaff;padding:12px;border-radius:12px}
-    .panel{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
-    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
-    button{padding:8px 12px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;cursor:pointer}
-    button:hover{filter:brightness(1.1)}
-  </style>
-</head>
-<body>
-  <h1>Edu Accessibility Agent (LangChain + llama.cpp tools)</h1>
-
-  <div class="panel">
-    <h2>Ask the Agent</h2>
-    <div class="row">
-      <input id="q" type="text" placeholder="e.g., What is due next week in course 12345?"/>
-      <button onclick="ask()">Ask</button>
-    </div>
-    <h3>Answer</h3>
-    <pre id="answer" class="mono"></pre>
-    <h3>Tool Trace</h3>
-    <pre id="trace" class="mono"></pre>
-  </div>
-
-  <div class="panel">
-    <h2>Upload Image (for Mathpix)</h2>
-    <input id="img" type="file" accept="image/*"/>
-    <button onclick="toDataUrl()">Make Data URL</button>
-    <pre id="imgOut" class="mono"></pre>
-  </div>
-
-  <div class="panel">
-    <h2>Play last TTS (if any)</h2>
-    <audio id="player" controls></audio>
-  </div>
-
-<script>
-async function ask(){
-  const q = document.getElementById('q').value.trim();
-  const r = await fetch('/api/agent', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ input: q })
-  });
-  const j = await r.json();
-  document.getElementById('answer').textContent = j.output || JSON.stringify(j,null,2);
-
-  // Try to auto-play audio if the agent used tts tool
-  if (j.intermediate_steps) {
-    const ttsStep = j.intermediate_steps.find(s => s.tool === 'tts');
-    if (ttsStep) {
-      try {
-        const data = JSON.parse(ttsStep.observation);
-        if (data.audio_url) {
-          const a = document.getElementById('player');
-          a.src = data.audio_url;
-          a.play().catch(()=>{});
-        }
-      } catch(e){}
-    }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Edu Agent</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+<style>
+  body {
+    font-family: 'Inter', sans-serif;
+    color: #f8f9fa;
+    background: linear-gradient(135deg, #013a3a 0%, #006d77 40%, #00b4d8 100%);
+    background-attachment: fixed;
+    min-height: 100vh;
   }
-  document.getElementById('trace').textContent = JSON.stringify(j.intermediate_steps, null, 2);
-}
 
-async function toDataUrl(){
-  const f = document.getElementById('img').files[0];
-  if(!f){ alert('Pick an image'); return; }
-  const fd = new FormData(); fd.append('file', f);
-  const r = await fetch('/api/upload-image', { method:'POST', body: fd });
-  const j = await r.json();
-  document.getElementById('imgOut').textContent = j.data_url ? j.data_url.slice(0,120) + '…' : JSON.stringify(j,null,2);
-}
-</script>
-</body>
+  h1, h2, .lead {
+    text-shadow: 0 0 8px rgba(255,255,255,0.15);
+  }
+
+  .card {
+    background: rgba(255, 255, 255, 0.07);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 1rem;
+    box-shadow: 0 0 20px rgba(0,0,0,0.25);
+  }
+
+  .btn {
+    font-size: 1.25rem;
+    border-radius: 1rem;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 10px rgba(255,255,255,0.2);
+  }
+
+  .big-btn {
+    font-size: 2rem;
+    padding: 1.5rem 3rem;
+    border-radius: 2rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #00b4d8, #38b000);
+    color: #fff;
+    border: none;
+    box-shadow: 0 0 25px rgba(0, 255, 200, 0.4);
+  }
+  .big-btn:hover {
+    background: linear-gradient(135deg, #48cae4, #56c596);
+  }
+
+  .status {
+    min-height: 2.5rem;
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .live { color: #9ef01a; text-shadow: 0 0 10px #00ffb3; }
+  .ok { color: #affc41; text-shadow: 0 0 10px #00ffa1; }
+  .err { color: #ff7a7a; white-space: pre-wrap; text-shadow: 0 0 10px #ff3c3c; }
+
+  pre.visually-big {
+    font-size: 1.25rem;
+    line-height: 1.6;
+  }
+
+  .hidden { display: none !important; }
+
+  .btn-outline-light.active, .btn-outline-light:focus {
+    background-color: #00b4d8;
+    border-color: #00b4d8;
+  }
+
+  /* gentle floating animation */
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-4px); }
+  }
+  .card, .big-btn {
+    animation: float 6s ease-in-out infinite;
+  }
+</style>
+</head>
+  <body class="bg-black text-white">
+    <main class="container py-5">
+      <header class="mb-4 text-center">
+        <h1 class="display-4 fw-bold">Edu Agent</h1>
+        <p class="lead">Press Space, Speak — or type. Your choice.</p>
+      </header>
+
+      <!-- Mode toggle -->
+      <section class="mb-4 d-flex justify-content-center">
+        <div class="btn-group" role="group" aria-label="Interaction mode">
+          <input type="radio" class="btn-check" name="mode" id="modeVoice" autocomplete="off" checked />
+          <label class="btn btn-outline-light" for="modeVoice" title="Use your voice">🎤 Voice</label>
+
+          <input type="radio" class="btn-check" name="mode" id="modeType" autocomplete="off" />
+          <label class="btn btn-outline-light" for="modeType" title="Type your request">⌨️ Type</label>
+        </div>
+      </section>
+
+      <!-- Status line (shared) -->
+      <div class="status visually-big text-center mb-3" id="status" role="status" aria-live="polite">Ready.</div>
+
+      <!-- VOICE MODE -->
+      <section id="voicePane">
+        <div class="d-flex flex-column align-items-center">
+          <div class="d-flex align-items-center">
+            <button id="recordBtn" type="button"
+                    class="btn btn-primary big-btn"
+                    aria-pressed="false"
+                    aria-label="Start or stop recording"
+                    title="Press Enter or Space to toggle">
+              🎤 Start Listening
+            </button>
+
+            <button id="restartBtn" type="button" class="btn btn-outline-light ms-3" style="display:none;">
+              ↻ Restart
+            </button>
+          </div>
+
+          <div class="card mt-4 w-100" style="max-width: 900px;">
+            <div class="card-body">
+              <h2 class="h4 mb-3">Transcript</h2>
+              <pre id="transcript" class="mb-0 visually-big" style="white-space: pre-wrap;"></pre>
+            </div>
+          </div>
+
+          <div class="card mt-4 w-100" style="max-width: 900px;">
+            <div class="card-body">
+              <h2 class="h4 mb-3">Agent Response</h2>
+              <pre id="agentOutVoice" class="mb-0 visually-big" style="white-space: pre-wrap;"></pre>
+            </div>
+          </div>
+
+          <p class="mt-4 text-secondary">
+            Tip: Press <kbd>Space</kbd> to toggle recording. High contrast &amp; large targets enabled.
+          </p>
+        </div>
+      </section>
+
+      <!-- TYPE MODE -->
+      <section id="typePane" class="hidden">
+        <div class="card mx-auto" style="max-width: 900px;">
+          <div class="card-body">
+            <label for="typeInput" class="form-label h4">Your request</label>
+            <textarea id="typeInput" class="form-control visually-big" rows="4"
+                      placeholder="Example: OCR tools/test1.png and summarize for me."></textarea>
+            <div class="d-flex mt-3">
+              <button id="sendBtn" class="btn btn-success me-2">Send</button>
+              <button id="clearBtn" class="btn btn-outline-light">Clear</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-4 mx-auto" style="max-width: 900px;">
+          <div class="card-body">
+            <h2 class="h4 mb-3">Agent Response</h2>
+            <pre id="agentOutText" class="mb-0 visually-big" style="white-space: pre-wrap;"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      // ===== Shared helpers =====
+      function setStatus(text, cls = "") {
+        const statusEl = document.getElementById("status");
+        statusEl.textContent = text;
+        statusEl.className = `status visually-big text-center mb-3 ${cls}`;
+      }
+
+      // Maintain a stable conversation id
+      const convId = (() => {
+        const k = "conv_id";
+        let v = localStorage.getItem(k);
+        if (!v) {
+          v = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+          localStorage.setItem(k, v);
+        }
+        return v;
+      })();
+
+      // ===== Mode toggle =====
+      const voicePane = document.getElementById("voicePane");
+      const typePane  = document.getElementById("typePane");
+      const modeVoice = document.getElementById("modeVoice");
+      const modeType  = document.getElementById("modeType");
+
+      function showVoice() { voicePane.classList.remove("hidden"); typePane.classList.add("hidden"); setStatus("Voice mode. Ready."); }
+      function showType()  { typePane.classList.remove("hidden"); voicePane.classList.add("hidden"); setStatus("Type mode. Ready."); }
+
+      modeVoice.addEventListener("change", () => { if (modeVoice.checked) showVoice(); });
+      modeType.addEventListener("change", () => { if (modeType.checked) showType(); });
+
+      // ===== Voice mode (your existing logic, minimized) =====
+      let mediaRecorder, mediaStream;
+      let chunks = [];
+      let chosenMime = "";
+      let fileExt = "webm";
+      let stopTimer = null;
+      let tickTimer = null;
+      const MAX_RECORD_MS = 20000; // 20s
+      let remainingMs = MAX_RECORD_MS;
+
+      const btn = document.getElementById("recordBtn");
+      const restartBtn = document.getElementById("restartBtn");
+      const transcriptEl = document.getElementById("transcript");
+      const agentOutVoice = document.getElementById("agentOutVoice");
+
+      function pickBestMime() {
+        const candidates = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus",
+          "audio/ogg",
+          "audio/mp4"
+        ];
+        if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+        for (const c of candidates) if (MediaRecorder.isTypeSupported(c)) return c;
+        return "";
+      }
+      function extForMime(m) {
+        if (!m) return "webm";
+        if (m.includes("ogg")) return "ogg";
+        if (m.includes("mp4")) return "mp4";
+        return "webm";
+      }
+      async function beep({ freq = 880, duration = 120, type = "sine", gain = 0.12 } = {}) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AC();
+        const osc = ctx.createOscillator();
+        const vol = ctx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        vol.gain.value = gain;
+        osc.connect(vol);
+        vol.connect(ctx.destination);
+        osc.start();
+        await new Promise(r => setTimeout(r, duration));
+        osc.stop();
+        await ctx.close();
+      }
+      const startBeep = () => beep({ freq: 880, duration: 120 });
+      const stopBeep  = () => beep({ freq: 440, duration: 160 });
+
+      function clearTimers() { if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; } if (tickTimer) { clearInterval(tickTimer); tickTimer = null; } }
+      function startCountdown() {
+        remainingMs = MAX_RECORD_MS;
+        const update = () => {
+          const s = Math.ceil(remainingMs / 1000);
+          setStatus(`Listening… Speak now. (${s}s)`, "live");
+          remainingMs -= 1000;
+        };
+        update();
+        tickTimer = setInterval(update, 1000);
+        stopTimer = setTimeout(() => { stopRecording(); }, MAX_RECORD_MS);
+      }
+
+      async function startRecording() {
+        try {
+          setStatus("Requesting microphone permission…");
+          restartBtn.style.display = "none";
+          restartBtn.disabled = true;
+
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+          });
+
+          chosenMime = pickBestMime();
+          fileExt = extForMime(chosenMime);
+
+          mediaRecorder = new MediaRecorder(
+            mediaStream,
+            chosenMime ? { mimeType: chosenMime } : undefined
+          );
+
+          chunks = [];
+          mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+
+          mediaRecorder.onstart = async () => {
+            btn.textContent = "■ Stop Listening";
+            btn.setAttribute("aria-pressed", "true");
+            btn.disabled = false;
+            try { await startBeep(); } catch {}
+            startCountdown();
+          };
+
+          mediaRecorder.onstop = async () => {
+            clearTimers();
+            try { await stopBeep(); } catch {}
+
+            setStatus("Processing…");
+            const blob = new Blob(chunks, { type: chosenMime || "audio/webm" });
+            chunks = [];
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            await uploadBlob(blob);
+            btn.textContent = "🎤 Start Listening";
+            btn.setAttribute("aria-pressed", "false");
+            restartBtn.style.display = "inline-block";
+            restartBtn.disabled = false;
+          };
+
+          mediaRecorder.start();
+        } catch (err) {
+          console.error(err);
+          setStatus("Microphone error. Check permissions.", "err");
+          btn.textContent = "🎤 Start Listening";
+          btn.setAttribute("aria-pressed", "false");
+          if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        }
+      }
+      function stopRecording() { if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop(); }
+
+      async function uploadBlob(blob) {
+        try {
+          const form = new FormData();
+          form.append("audio", blob, `recording.${fileExt}`);
+          form.append("conv_id", convId);
+
+          const res = await fetch("/transcribe_and_run", { method: "POST", body: form });
+          const data = await res.json();
+
+          if (!res.ok || !data.ok) {
+            setStatus("Transcription/agent run failed.", "err");
+            transcriptEl.textContent = (data && (data.error || "Unknown error")) || "Unknown error";
+            agentOutVoice.textContent = "";
+            return;
+          }
+
+          transcriptEl.textContent = data.transcript || "(no text)";
+
+          const agent = data.agent || {};
+          const content = (agent.ok ? agent.content : (agent.content || "Agent error")) || "";
+          agentOutVoice.textContent = content;
+
+          if (data.agent_audio_b64) playMp3Base64(data.agent_audio_b64);
+          setStatus("Done.", "ok");
+        } catch (e) {
+          console.error(e);
+          setStatus("Upload error.", "err");
+          agentOutVoice.textContent = "";
+        }
+      }
+
+      function playMp3Base64(b64) {
+        try {
+          const raw = atob(b64);
+          const len = raw.length;
+          const buf = new Uint8Array(len);
+          for (let i = 0; i < len; i++) buf[i] = raw.charCodeAt(i);
+          const blob = new Blob([buf], { type: "audio/mpeg" });
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          audio.play().catch(() => {
+            setStatus("Tap to play response.", "ok");
+            const btn = document.createElement("button");
+            btn.className = "btn btn-success mt-3";
+            btn.textContent = "▶ Play Agent Response";
+            btn.onclick = () => audio.play();
+            // append near whichever pane is visible
+            (modeVoice.checked ? agentOutVoice.parentElement : agentOutText.parentElement).appendChild(btn);
+          });
+        } catch (e) {
+          console.error("Audio playback error:", e);
+        }
+      }
+
+      // Controls
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          if (!mediaRecorder || mediaRecorder.state === "inactive") {
+            transcriptEl.textContent = "";
+            await startRecording();
+          } else {
+            stopRecording();
+          }
+        } catch (err) {
+          console.error(err);
+          setStatus("Start/stop error.", "err");
+        } finally {
+          if (!mediaRecorder || mediaRecorder.state !== "recording") btn.disabled = false;
+        }
+      });
+      document.getElementById("restartBtn").addEventListener("click", async (e) => {
+        e.preventDefault();
+        if (mediaRecorder && mediaRecorder.state === "recording") return;
+        transcriptEl.textContent = "";
+        setStatus("Ready.");
+        try { await startRecording(); } catch (err) { console.error(err); setStatus("Failed to restart.", "err"); } finally { btn.focus(); }
+      });
+      window.addEventListener("keydown", (e) => {
+        if (modeVoice.checked && (e.code === "Space" || e.key === "Enter") && !e.repeat) {
+          e.preventDefault();
+          btn.click();
+        }
+      });
+
+      // ===== Type mode =====
+      const sendBtn   = document.getElementById("sendBtn");
+      const clearBtn  = document.getElementById("clearBtn");
+      const typeInput = document.getElementById("typeInput");
+      const agentOutText = document.getElementById("agentOutText");
+
+      clearBtn.addEventListener("click", () => { typeInput.value = ""; agentOutText.textContent = ""; setStatus("Type mode. Ready."); });
+      sendBtn.addEventListener("click", sendText);
+      typeInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendText(); }
+      });
+
+      async function sendText() {
+        const text = (typeInput.value || "").trim();
+        if (!text) { setStatus("Please type a request first.", "err"); return; }
+        setStatus("Thinking…");
+        agentOutText.textContent = "";
+
+        try {
+          const res = await fetch("/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text, conv_id: convId })
+          });
+          const data = await res.json();
+
+          if (!res.ok || !data.ok) {
+            setStatus("Agent error.", "err");
+            agentOutText.textContent = (data && (data.error || (data.agent && data.agent.content))) || "Unknown error";
+            return;
+          }
+
+          const agent = data.agent || {};
+          const content = (agent.ok ? agent.content : (agent.content || "Agent error")) || "";
+          agentOutText.textContent = content;
+
+          if (data.agent_audio_b64) playMp3Base64(data.agent_audio_b64);
+          setStatus("Done.", "ok");
+        } catch (e) {
+          console.error(e);
+          setStatus("Network error.", "err");
+          agentOutText.textContent = "";
+        }
+      }
+
+      // default view
+      showVoice();
+    </script>
+  </body>
 </html>

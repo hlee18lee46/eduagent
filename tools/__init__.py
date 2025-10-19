@@ -6,4 +6,7 @@ from .gemini_summary_tool import gemini_summary  # <-- add this
 from .auth_tool import auth_login
 from .signup_tool import auth_signup
 from .s2_ingest import s2_ingest_paper
-TOOLS = [mathpix_ocr, canvas_assignments, s2_search, tts, gemini_summary, auth_login, auth_signup, s2_ingest_paper]
+from .llvm_mca_tool import llvm_mca_report
+from .canvas_course_tool import canvas_courses
+
+TOOLS = [mathpix_ocr, canvas_assignments, s2_search, tts, gemini_summary, auth_login, auth_signup, s2_ingest_paper, llvm_mca_report, canvas_courses]

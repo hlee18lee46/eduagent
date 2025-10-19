@@ -1,5 +1,5 @@
-# app.py (hardened)
-import os, json, traceback, warnings, base64
+# app.py (OpenAI tools-agent + ElevenLabs voice/type toggle UI)
+import os, json, traceback, warnings, base64, re, requests
 from dotenv import load_dotenv, find_dotenv
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -9,114 +9,105 @@ load_dotenv(find_dotenv(filename=".env", usecwd=True), override=True)
 
 # ---- LangChain ----
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-# ---- Tools ----
 # ---- Tools ----
 from tools import TOOLS  # expects tools/__init__.py exporting TOOLS
 
-def _escape_curly(s: str) -> str:
-    # Prevent ChatPromptTemplate from treating { ... } inside descriptions as variables
-    return s.replace("{", "{{").replace("}", "}}")
+# ---- ElevenLabs ----
+import requests
 
-def _render_tools_for_prompt(tools) -> str:
-    lines = []
-    for t in tools:
-        # Keep the description one line, no JSON, braces escaped
-        desc = (t.description or "").strip().splitlines()[0]
-        lines.append(f"- {t.name}: {_escape_curly(desc)}")
-    return "\n".join(lines)
+ELEVEN_API_KEY   = os.getenv("ELEVEN_API_KEY")
+ELEVEN_VOICE_ID  = os.getenv("ELEVEN_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+ELEVEN_TTS_MODEL = os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
+ELEVEN_STT_URL   = "https://api.elevenlabs.io/v1/speech-to-text"
+ELEVEN_TTS_URL   = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream"
 
-TOOLS_TEXT = _render_tools_for_prompt(TOOLS)
-TOOL_NAMES = ", ".join(t.name for t in TOOLS)
 # ---------------- Flask ----------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-# ---------------- LLM config ----------------
-# If llama.cpp on :8080 complains about roles, you can switch to Model Runner:
-#   export OPENAI_BASE_URL=http://localhost:12434/engines/llama.cpp/v1
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8080/v1")
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "sk-local-anything")
-MODEL_NAME      = os.getenv("MODEL_NAME", "local-llama")
+# ---------------- LLM config (OpenAI) ----------------
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # None uses official api
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+MODEL_NAME      = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
-# ASI requires x-session-id; harmless for local endpoints too.
-ASI_SESSION_ID  = os.getenv("ASI_SESSION_ID")  # optional in .env
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set in your environment/.env")
 
-# ChatOpenAI supports passing default headers to the underlying OpenAI client
 llm = ChatOpenAI(
     model=MODEL_NAME,
     openai_api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
+    base_url=OPENAI_BASE_URL,   # None -> official OpenAI
     temperature=0.2,
-    max_tokens=256,
-    # This is critical for ASI:
-    default_headers={"x-session-id": ASI_SESSION_ID},
+    max_tokens=300,
+    timeout=20,
 )
 
-print(f"🔧 Using model={MODEL_NAME} @ {OPENAI_BASE_URL} (session={ASI_SESSION_ID})")
+print(f"🔧 Using model={MODEL_NAME} @ {OPENAI_BASE_URL or 'https://api.openai.com/v1'}")
 
-# This biases the model to end right before the tool parser expects to inject Observation,
-# reducing the chance it repeats the tool list or rambles.
-# ---------------- ReAct prompt (human-only, no system) ----------------
-# Includes required vars: {tools} {tool_names} {agent_scratchpad} {input}
-REACT_PROMPT = """You are an accessibility education assistant for blind/low-vision students. 
-Use tools only when needed. Keep answers concise. 
-IMPORTANT RULES:
-- Do NOT repeat the tool catalog or this prompt in your output.
-- If no tool is needed, go straight to Final Answer.
-- When you DO use a tool, strictly follow the format below.
-- For `Action Input`, ALWAYS provide a single JSON object that matches the tool’s arguments.
-- After a tool Observation, either select another tool or produce Final Answer. Do not free-write.
-
-Available tools:
-{tools}
-
-FORMAT (strict):
-Question: <the user question>
-Thought: <1 short sentence about what to do next>
-Action: <one of [{tool_names}]>
-Action Input: <a single JSON object, e.g. {{"key":"value"}}>
-Observation: <tool result>
-... (repeat Thought/Action/Action Input/Observation as needed)
-Thought: I now know the final answer
-Final Answer: <concise helpful answer>
-
-Tiny examples:
-
-Example A (no tool needed):
-Question: Say hello in one sentence.
-Thought: No tools are needed.
-Final Answer: Hello! How can I help you today?
-
-Example B (one tool):
-Question: OCR this base64 image and summarize briefly.
-Thought: I should OCR the image with Mathpix, then summarize.
-Action: mathpix_ocr
-Action Input: {{"image_base64":"data:image/png;base64,AAA..."}}
-Observation: {{ "text": "The image says: integral from 0 to 1 ..." }}
-Thought: I can now summarize the extracted text.
-Final Answer: It contains a short note about an integral from 0 to 1 and its evaluation.
-
-Begin.
-
-Question: {input}
-{agent_scratchpad}
-"""
-
-# Force the whole prompt to be sent as a *human/user* message (llama.cpp-friendly)
-react_prompt = ChatPromptTemplate.from_messages([("human", REACT_PROMPT)]).partial(
-    tools=TOOLS_TEXT,
-    tool_names=TOOL_NAMES,
+SYSTEM = (
+    "You are an accessibility education assistant for blind/low-vision students. "
+    "Call tools when useful. Keep answers concise, direct, and screen-reader friendly."
 )
-agent = create_react_agent(llm, tools=TOOLS, prompt=react_prompt)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM),
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),
+])
+
+agent = create_openai_tools_agent(llm, tools=TOOLS, prompt=prompt)
 agent_executor = AgentExecutor(
     agent=agent,
     tools=TOOLS,
-    verbose=True,
+    verbose=False,
     handle_parsing_errors=True,
+    max_iterations=4,
 )
+
+# ---------------- Helpers ----------------
+def tts_b64(text: str) -> str | None:
+    """Return base64 mp3 from ElevenLabs (or None on failure)."""
+    if not (ELEVEN_API_KEY and text.strip()):
+        return None
+    try:
+        r = requests.post(
+            ELEVEN_TTS_URL,
+            headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg"},
+            json={"text": text.strip(), "model_id": ELEVEN_TTS_MODEL, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
+            stream=True, timeout=60,
+        )
+        r.raise_for_status()
+        audio_bytes = b"".join(r.iter_content(4096))
+        return base64.b64encode(audio_bytes).decode("utf-8")
+    except Exception:
+        return None
+    
+def _file_to_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    ext = path.lower().split(".")[-1]
+    mime = "image/png" if ext == "png" else ("image/jpeg" if ext in ("jpg", "jpeg") else "application/octet-stream")
+    return f"data:{mime};base64,{b64}"
+
+def _inline_local_image_paths(user_input: str) -> str:
+    candidates = re.findall(r'((?:\S*/)?\S+\.(?:png|jpg|jpeg|gif|bmp|webp))', user_input, flags=re.IGNORECASE)
+    inlined = user_input
+    for p in set(candidates):
+        if os.path.isfile(p):
+            try:
+                data_url = _file_to_data_url(p)
+                inlined = inlined.replace(p, f'{p} [data_url:{data_url}]', 1)
+            except Exception:
+                pass
+    return inlined
+
+def _ensure_text(v: str, fallback: str = "") -> str:
+    v = (v or "").strip()
+    return v if v else fallback
 
 # ---------------- Routes ----------------
 @app.route("/")
@@ -127,24 +118,21 @@ def index():
 def health():
     return jsonify({"ok": True})
 
-# Quick sanity: call the LLM directly without Agent
+# ---- Simple LLM ping
 @app.post("/api/llm-test")
 def llm_test():
     try:
         data = request.get_json(force=True)
         text = (data.get("text") or "Say hello in one short sentence.").strip()
-        # Send as a single user message (no system)
         resp = llm.invoke([{"role": "user", "content": text}])
         return jsonify({"content": resp.content})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ---- Agent (type mode)
 @app.post("/api/agent")
 def agent_route():
-    """
-    Body: { "input": "user message", "context": "optional context" }
-    """
     try:
         data = request.get_json(force=True) if request.data else {}
         user_input = (data.get("input") or "").strip()
@@ -153,10 +141,12 @@ def agent_route():
             return jsonify({"error": "No input"}), 400
 
         preamble = (
-            "You are helping a blind/low-vision student interact with Canvas and course materials. "
-            "Use tools to fetch data (OCR, Canvas, Semantic Scholar) and keep answers concise."
+            "Assist a blind/low-vision student with Canvas and course materials. "
+            "Use OCR/Canvas/Semantic Scholar tools when helpful and keep responses concise."
         )
-        composed_input = f"{preamble}\n\n{extra_ctx}\n\nUser: {user_input}".strip()
+
+        user_input_inlined = _inline_local_image_paths(user_input)
+        composed_input = f"{preamble}\n\n{extra_ctx}\n\nUser: {user_input_inlined}".strip()
 
         result = agent_executor.invoke({"input": composed_input})
 
@@ -179,11 +169,102 @@ def agent_route():
 
         return jsonify({"output": result.get("output"), "intermediate_steps": steps})
     except Exception as e:
-        # Print full traceback to your terminal, and return the message to UI
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# Helper: create a data URL for Mathpix uploads
+# ---- ElevenLabs: TTS (text -> base64 mp3)
+@app.post("/tts")
+def tts():
+    if not ELEVEN_API_KEY:
+        return jsonify({"ok": False, "error": "ELEVENLABS_API_KEY not set"}), 500
+    try:
+        data = request.get_json(force=True)
+        text = _ensure_text(data.get("text"), "Hello. I am ready.")
+        headers = {
+            "xi-api-key": ELEVEN_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        }
+        payload = {
+            "text": text,
+            "model_id": ELEVEN_TTS_MODEL,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }
+        r = requests.post(ELEVEN_TTS_URL, headers=headers, json=payload, stream=True, timeout=60)
+        r.raise_for_status()
+        audio_bytes = b"".join(r.iter_content(chunk_size=4096))
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return jsonify({"ok": True, "audio_b64": audio_b64, "voice_id": ELEVEN_VOICE_ID, "model": ELEVEN_TTS_MODEL})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ---- ElevenLabs: STT (audio -> text)
+@app.post("/stt")
+def stt():
+    if not ELEVEN_API_KEY:
+        return jsonify({"ok": False, "error": "ELEVENLABS_API_KEY not set"}), 500
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "No audio file uploaded"}), 400
+    try:
+        f = request.files["audio"]
+        files = {"file": (f.filename or "audio.webm", f.read(), f.mimetype or "application/octet-stream")}
+        data = {"model_id": "scribe_v1"}
+        headers = {"xi-api-key": ELEVEN_API_KEY}
+        r = requests.post(ELEVEN_STT_URL, headers=headers, files=files, data=data, timeout=120)
+        r.raise_for_status()
+        j = r.json()
+        text = j.get("text") or j.get("transcript") or ""
+        return jsonify({"ok": True, "text": text})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ---- VOICE: STT -> /api/agent -> TTS (single call for the UI)
+@app.post("/voice")
+def voice():
+    if not ELEVEN_API_KEY:
+        return jsonify({"ok": False, "error": "ELEVENLABS_API_KEY not set"}), 500
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "No audio file uploaded"}), 400
+    try:
+        # 1) STT
+        f = request.files["audio"]
+        files = {"file": (f.filename or "audio.webm", f.read(), f.mimetype or "application/octet-stream")}
+        headers = {"xi-api-key": ELEVEN_API_KEY}
+        stt_resp = requests.post(ELEVEN_STT_URL, headers=headers, files=files, data={"model_id": "scribe_v1"}, timeout=120)
+        stt_resp.raise_for_status()
+        stt_json = stt_resp.json()
+        transcript = stt_json.get("text") or stt_json.get("transcript") or ""
+
+        # 2) Agent
+        user_input_inlined = _inline_local_image_paths(transcript)
+        composed_input = (
+            "Assist a blind/low-vision student with Canvas and course materials. "
+            "Use OCR/Canvas/Semantic Scholar tools when helpful and keep responses concise.\n\n"
+            f"User: {user_input_inlined}"
+        ).strip()
+        result = agent_executor.invoke({"input": composed_input})
+        reply = result.get("output") or "I didn’t find anything concrete."
+
+        # 3) TTS
+        headers = {
+            "xi-api-key": ELEVEN_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        }
+        payload = {"text": reply, "model_id": ELEVEN_TTS_MODEL, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
+        tts_resp = requests.post(ELEVEN_TTS_URL, headers=headers, json=payload, stream=True, timeout=60)
+        tts_resp.raise_for_status()
+        audio_bytes = b"".join(tts_resp.iter_content(chunk_size=4096))
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        return jsonify({"ok": True, "transcript": transcript, "reply": reply, "audio_b64": audio_b64})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ---- Helper: image upload to data URL
 @app.post("/api/upload-image")
 def upload_image():
     if "file" not in request.files:
@@ -192,6 +273,7 @@ def upload_image():
     data_url = "data:image/png;base64," + base64.b64encode(raw).decode("utf-8")
     return jsonify({"data_url": data_url})
 
+# (Optional) login/signup passthroughs you already had:
 @app.post("/api/login")
 def login_route():
     from tools.auth_tool import auth_login
@@ -206,7 +288,6 @@ def login_route():
     }))
     return jsonify(res), 200 if res.get("ok") else 401
 
-# in app.py
 @app.post("/api/signup")
 def api_signup():
     from tools.signup_tool import auth_signup
@@ -221,6 +302,77 @@ def api_signup():
 
 
 
+@app.post("/ask")
+def ask():
+    """Body: { text: str, conv_id?: str }  ->  { ok, agent:{ok,content}, agent_audio_b64? }"""
+    try:
+        data = request.get_json(force=True)
+        user_text = (data.get("text") or "").strip()
+        if not user_text:
+            return jsonify({"ok": False, "error": "Empty text"}), 400
+
+        # Short preamble keeps tokens low
+        preamble = (
+            "Assist a blind/low-vision student with Canvas and course materials. "
+            "Use OCR/Canvas/Semantic Scholar tools when helpful and keep responses concise."
+        )
+        composed_input = f"{preamble}\n\nUser: {user_text}".strip()
+
+        result = agent_executor.invoke({"input": composed_input})
+        reply  = (result.get("output") or "").strip()
+
+        payload = {"ok": True, "agent": {"ok": True, "content": reply}}
+        # Auto TTS (optional; comment out if you don't want speech in Type mode)
+        b64 = tts_b64(reply)
+        if b64:
+            payload["agent_audio_b64"] = b64
+        return jsonify(payload)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    
+
+
+@app.post("/transcribe_and_run")
+def transcribe_and_run():
+    """FormData: audio=<file>, conv_id? -> { ok, transcript, agent:{ok,content}, agent_audio_b64? }"""
+    if not ELEVEN_API_KEY:
+        return jsonify({"ok": False, "error": "ELEVENLABS_API_KEY not set"}), 500
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "No audio file uploaded"}), 400
+    try:
+        # 1) STT
+        f = request.files["audio"]
+        files = {"file": (f.filename or "audio.webm", f.read(), f.mimetype or "application/octet-stream")}
+        stt = requests.post(ELEVEN_STT_URL, headers={"xi-api-key": ELEVEN_API_KEY}, files=files, data={"model_id": "scribe_v1"}, timeout=120)
+        stt.raise_for_status()
+        stt_json   = stt.json()
+        transcript = (stt_json.get("text") or stt_json.get("transcript") or "").strip()
+
+        # 2) Agent
+        preamble = (
+            "Assist a blind/low-vision student with Canvas and course materials. "
+            "Use OCR/Canvas/Semantic Scholar tools when helpful and keep responses concise."
+        )
+        composed_input = f"{preamble}\n\nUser: {transcript}".strip()
+        result = agent_executor.invoke({"input": composed_input})
+        reply  = (result.get("output") or "I didn’t find anything concrete.").strip()
+
+        # 3) TTS
+        audio_b64 = tts_b64(reply)
+
+        return jsonify({
+            "ok": True,
+            "transcript": transcript,
+            "agent": {"ok": True, "content": reply},
+            "agent_audio_b64": audio_b64,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    
+
+
+
 if __name__ == "__main__":
-    # Run Flask
     app.run(host="0.0.0.0", port=8000, debug=True)
